@@ -174,7 +174,7 @@ def is_league_cached_safe(league_name):
         return False
 
 # --- INFO HEADER (GLOBAL) ---
-st.info("ℹ️ **Hinweis:** Die Daten werden täglich aktualisiert. Die Simulationsergebnisse basieren auf Monte-Carlo-Berechnungen (500x) und können leicht variieren.", icon="🎲")
+st.info("ℹ️ **Hinweis:** Die Daten werden täglich aktualisiert. Die Simulationsergebnisse können nach jeder aktualisierung leicht variieren.", icon="🎲")
 
 # --- SIDEBAR ---
 with st.sidebar:
