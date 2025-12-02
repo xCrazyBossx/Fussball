@@ -9,10 +9,12 @@ st.set_page_config(page_title="Europa Fußball KI", layout="wide")
 
 # --- SICHERHEITS-KONFIGURATION ---
 try:
+    # ACHTUNG: Auf dem Server in Streamlit Secrets eintragen!
     API_KEY = st.secrets["API_KEY"]
     ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 except Exception:
-    st.error("⚠️ **Sicherheits-Fehler:** Keine Secrets gefunden.")
+    st.error("⚠️ **Sicherheits-Fehler:** Die App konnte die API-Schlüssel nicht finden.")
+    st.info("Bitte trage `API_KEY` und `ADMIN_PASSWORD` in die Streamlit Cloud Secrets ein.")
     st.stop()
 
 LEAGUES = {
@@ -25,16 +27,14 @@ LEAGUES = {
 }
 
 # --- STATE INITIALISIERUNG ---
-if 'league_data' not in st.session_state:
-    st.session_state.league_data = {}
-
+# Wir nutzen den Session State nur für UI-Einstellungen, nicht für Daten
 if 'selected_league' not in st.session_state:
     st.session_state.selected_league = "Dashboard"
 
 if 'is_admin' not in st.session_state:
     st.session_state.is_admin = False
 
-# --- HELPER ---
+# --- HELPER (Team-Namen Übersetzer) ---
 TEAM_TRANSLATION = {
     "Bayern Munich": "FC Bayern München", "Bayer Leverkusen": "Bayer 04 Leverkusen", "Borussia Dortmund": "Borussia Dortmund",
     "RB Leipzig": "RB Leipzig", "Union Berlin": "1. FC Union Berlin", "Freiburg": "SC Freiburg",
@@ -55,40 +55,47 @@ TEAM_TRANSLATION = {
 
 def translate_team(name): return TEAM_TRANSLATION.get(name, name)
 
-# --- CORE LOGIK: LADEN & SIMULIEREN ---
-def update_league_data(league_name):
+# --- ZENTRALE LADE-FUNKTION (GLOBAL CACHED) ---
+@st.cache_data(ttl=3600) # Speichert die Daten 1 Stunde lang GLOBAL
+def fetch_and_simulate_league(league_name):
+    """
+    Lädt Matches & Torschützen UND führt die Simulation durch.
+    Dieses Ergebnis ist global (für alle Nutzer) gültig.
+    """
     config = LEAGUES[league_name]
     matches, logo_mapping = data.fetch_matches_external(API_KEY, config["id"])
     
-    bundle = {
+    # Defaults
+    result = {
         "table": pd.DataFrame(), "prognose": pd.DataFrame(), "kicktipp": pd.DataFrame(),
         "scorers": pd.DataFrame(), "bracket": pd.DataFrame(), "leader": "-", "leader_logo": "",
         "champ_pred": "-", "top_scorer": "-", "last_updated": datetime.now().strftime("%d.%m. %H:%M")
     }
-
-    if matches.empty:
-        st.session_state.league_data[league_name] = bundle
-        return False
+    
+    if matches.empty: return result
 
     table = data.calculate_current_table(matches)
     is_cl = (league_name == "Champions League")
     
+    # Leader Info
     if not table.empty:
         leader_raw = table.index[0]
-        bundle["leader"] = translate_team(leader_raw)
-        bundle["leader_logo"] = logo_mapping.get(leader_raw, "")
+        result["leader"] = translate_team(leader_raw)
+        result["leader_logo"] = logo_mapping.get(leader_raw, "")
 
     try:
         prognose_raw = simulation.simulate_season(matches, table, n_simulations=500, is_cl=is_cl)
         
+        # CL Bracket
         if is_cl:
             cl_bracket = simulation.generate_cl_bracket(matches, table)
             if not cl_bracket.empty:
                 cl_bracket['Heim'] = cl_bracket['Heim'].apply(translate_team)
                 cl_bracket['Gast'] = cl_bracket['Gast'].apply(translate_team)
                 cl_bracket['Sieger'] = cl_bracket['Sieger'].apply(translate_team)
-                bundle["bracket"] = cl_bracket
+                result["bracket"] = cl_bracket
 
+        # Prognose aufräumen
         cols = ['Titel', 'Top8', 'Playoff', 'Out', 'Meister', 'CL', 'EL', 'ConfL', 'Abstieg', 'AvgPoints']
         for c in cols:
             if c not in prognose_raw.columns: prognose_raw[c] = 0.0
@@ -103,16 +110,18 @@ def update_league_data(league_name):
         keep_cols = ['Platz', 'Wappen', 'DisplayTeam', 'AvgPoints']
         keep_cols += ['Titel', 'Top8', 'Playoff', 'Out'] if is_cl else ['Meister', 'CL', 'EL', 'ConfL', 'Abstieg']
         
-        bundle["prognose"] = prognose_raw[keep_cols]
+        result["prognose"] = prognose_raw[keep_cols]
         
+        # Meister/Sieger für Dashboard
         if not prognose_raw.empty:
             sort_col = 'Titel' if is_cl else 'Meister'
             champ_row = prognose_raw.sort_values(sort_col, ascending=False).iloc[0]
-            bundle["champ_pred"] = champ_row['DisplayTeam']
+            result["champ_pred"] = champ_row['DisplayTeam']
 
     except Exception as e:
         print(f"Fehler Simulation {league_name}: {e}")
 
+    # Kicktipp
     next_n = 18 if is_cl else (9 if league_name in ["Bundesliga", "Ligue 1"] else 10)
     kicktipp = simulation.predict_upcoming_matches(matches, next_n=next_n)
     if not kicktipp.empty:
@@ -122,14 +131,16 @@ def update_league_data(league_name):
         kicktipp['Heim'] = kicktipp['Heim'].apply(translate_team)
         kicktipp['Auswärts'] = kicktipp['Auswärts'].apply(translate_team)
         kicktipp = kicktipp[['Anstoß', 'HeimWappen', 'Heim', 'GastWappen', 'Auswärts', 'Tipp', '1', 'X', '2']]
-        bundle["kicktipp"] = kicktipp
+        result["kicktipp"] = kicktipp
 
+    # Tabelle Finalisieren
     table.insert(0, 'Platz', range(1, 1 + len(table)))
     table['OriginalName'] = table.index
     table['Wappen'] = table['OriginalName'].map(lambda x: logo_mapping.get(x, ""))
     table['DisplayTeam'] = table['OriginalName'].apply(translate_team)
-    bundle["table"] = table
+    result["table"] = table
 
+    # Scorers
     scorers = data.fetch_scorers_external(API_KEY, config["id"])
     if not scorers.empty:
         scorers['Wappen'] = scorers['Team'].map(lambda x: logo_mapping.get(x, ""))
@@ -144,13 +155,12 @@ def update_league_data(league_name):
         
         scorers = scorers.sort_values(by=['Prognose', 'Tore'], ascending=False).head(15)
         scorers.insert(0, 'Platz', range(1, 1 + len(scorers)))
-        bundle["scorers"] = scorers[['Platz', 'Wappen', 'Spieler', 'Team', 'Tore', 'Prognose']]
+        result["scorers"] = scorers[['Platz', 'Wappen', 'Spieler', 'Team', 'Tore', 'Prognose']]
         
         top = scorers.iloc[0]
-        bundle["top_scorer"] = f"{top['Spieler']} ({top['Tore']})"
+        result["top_scorer"] = f"{top['Spieler']} ({top['Tore']})"
 
-    st.session_state.league_data[league_name] = bundle
-    return True
+    return result
 
 # --- INFO HEADER (GLOBAL) ---
 st.info("ℹ️ **Hinweis:** Die Daten werden täglich aktualisiert. Die Simulationsergebnisse basieren auf Monte-Carlo-Berechnungen (500x) und können leicht variieren.", icon="🎲")
@@ -166,10 +176,12 @@ with st.sidebar:
     st.caption("Ligen:")
     for league in LEAGUES.keys():
         label = f"{LEAGUES[league]['logo']} {league}"
+        
+        # Zeigt den Lade-Zustand an
+        if fetch_and_simulate_league.is_cached(league):
+            label += " (✅)"
+        
         if st.button(label):
-            if league not in st.session_state.league_data:
-                with st.spinner(f"Initialisiere {league}..."):
-                    update_league_data(league)
             st.session_state.selected_league = league
             st.rerun()
             
@@ -204,17 +216,19 @@ with st.sidebar:
             st.write("---")
             for league in LEAGUES.keys():
                 if st.button(f"🔄 Update {league}"):
-                    with st.spinner(f"Lade {league}..."):
-                        update_league_data(league)
-                    st.toast(f"{league} aktualisiert!", icon="✅")
-                    st.rerun()
+                    # LÖSCHT DEN GLOBALEN CACHE FÜR DIESE LIGA
+                    fetch_and_simulate_league.clear_cache(league)
+                    st.toast(f"{league} wird neu geladen!", icon="✅")
+                    # Die Daten werden beim nächsten Rerun automatisch neu geholt
+                    st.rerun() 
             if st.button("🔴 Cache komplett leeren"):
-                st.session_state.league_data = {}
+                fetch_and_simulate_league.clear()
                 st.rerun()
 
 # --- VIEW: DASHBOARD ---
 def show_dashboard():
     st.title("🇪🇺 Europa Fußball Dashboard")
+    
     cols = st.columns(3)
     for i, (league_name, config) in enumerate(LEAGUES.items()):
         col_idx = i % 3
@@ -225,34 +239,34 @@ def show_dashboard():
                 if st.session_state.is_admin:
                     with c_head2:
                         if st.button("🔄", key=f"dash_rl_{league_name}", help="Admin: Neu laden"):
-                            with st.spinner("..."): update_league_data(league_name)
+                            fetch_and_simulate_league.clear_cache(league_name)
                             st.rerun()
 
-                data = st.session_state.league_data.get(league_name)
+                # Daten holzen (Cache wird genutzt!)
+                data = fetch_and_simulate_league(league_name)
                 
-                if data:
+                if data and data.get('leader') != "-":
                     st.caption(f"Stand: {data.get('last_updated', '-')}")
-                    if data.get('leader') != "-":
-                        c1, c2 = st.columns([1, 3])
-                        with c1: 
-                            if data.get('leader_logo'): st.image(data['leader_logo'])
-                        with c2: st.metric("Führer", data.get('leader', '-'))
-                        st.divider()
-                        lbl = "🔮 Turnier-Sieger" if league_name == "Champions League" else "🔮 Meister-Tipp"
-                        st.caption(lbl)
-                        pred = data.get('champ_pred')
-                        if pred == data.get('leader'): st.success(f"**{pred}**")
-                        else: st.warning(f"**{pred}**")
-                        st.caption("👟 Top-Torjäger")
-                        st.write(f"**{data.get('top_scorer')}**")
-                    else: st.warning("Keine Match-Daten.")
+                    c1, c2 = st.columns([1, 3])
+                    with c1: 
+                        if data.get('leader_logo'): st.image(data['leader_logo'])
+                    with c2: st.metric("Führer", data.get('leader', '-'))
+                    
+                    st.divider()
+                    lbl = "🔮 Turnier-Sieger" if league_name == "Champions League" else "🔮 Meister-Tipp"
+                    st.caption(lbl)
+                    pred = data.get('champ_pred')
+                    if pred == data.get('leader'): st.success(f"**{pred}**")
+                    else: st.warning(f"**{pred}**")
+                    
+                    st.caption("👟 Top-Torjäger")
+                    st.write(f"**{data.get('top_scorer')}**")
+                    
                     if st.button(f"Zur Analyse ➜", key=f"btn_{league_name}"):
                         st.session_state.selected_league = league_name; st.rerun()
                 else:
-                    st.info("Daten nicht geladen.")
-                    if st.button("Initialisieren", key=f"load_{league_name}"):
-                        with st.spinner("Lade..."): update_league_data(league_name)
-                        st.rerun()
+                    st.info("Lade Daten...")
+
 
 # --- VIEW: DETAILS ---
 def show_league_detail(league_name):
@@ -260,28 +274,23 @@ def show_league_detail(league_name):
         st.session_state.selected_league = "Dashboard"; st.rerun()
     
     st.title(f"{LEAGUES[league_name]['logo']} {league_name} KI-Analyse")
-    data = st.session_state.league_data.get(league_name)
     
-    if not data:
-        st.info(f"Daten für {league_name} sind noch nicht geladen.")
-        if st.button("Daten jetzt laden"):
-            with st.spinner("Simuliere..."): update_league_data(league_name)
-            st.rerun()
-        return
-
+    # Daten holen
+    data = fetch_and_simulate_league(league_name)
+    
     if data['table'].empty and data['scorers'].empty:
-        st.error("Keine Daten verfügbar (API Fehler oder Saisonpause).")
-        return
+        st.error("Keine Daten verfügbar (API Fehler oder Saisonpause)."); return
         
     if st.session_state.is_admin:
         if st.button("🔄 Admin: Daten aktualisieren"):
-            with st.spinner("Aktualisiere..."): update_league_data(league_name)
+            fetch_and_simulate_league.clear_cache(league_name)
             st.rerun()
 
     tabs = ["🏆 Tabelle & Prognose", "🎲 Kicktipp-Helfer", "👟 Torschützen"]
     if league_name == "Champions League": tabs.append("🏆 K.O.-Baum")
     active_tabs = st.tabs(tabs)
 
+    # TAB 1
     with active_tabs[0]:
         if not data['prognose'].empty:
             c1, c2 = st.columns([1.5, 1])
@@ -327,8 +336,7 @@ def show_league_detail(league_name):
 
     if league_name == "Champions League":
         with active_tabs[3]:
-            st.subheader("🏆 Simulierter K.O.-Baum (Szenario)")
-            st.info("Dieses Szenario basiert auf der aktuellen Form und dem Heimvorteil.")
+            st.subheader("🏆 Simulierter K.O.-Baum")
             bracket = data.get('bracket')
             if bracket is not None and not bracket.empty:
                 final_match = bracket[bracket['Runde'] == 'Finale']
@@ -365,15 +373,15 @@ def show_legal_page(page_type):
         st.markdown("""
         **Angaben gemäß § 5 TMG**
 
-        Max Mustermann (Dein Name)  
-        Musterstraße 1 (Deine Adresse)  
-        12345 Musterstadt  
+        Ihr Name  
+        Ihre Adresse  
+        Ihre Postleitzahl und Ort  
 
-        **Kontakt:** E-Mail: muster@example.com  
+        **Kontakt:** E-Mail: Ihre@email.de  
         
-        **Verantwortlich für den Inhalt nach § 55 Abs. 2 RStV:** Max Mustermann  
-        Musterstraße 1  
-        12345 Musterstadt  
+        **Verantwortlich für den Inhalt nach § 55 Abs. 2 RStV:** Ihr Name  
+        Ihre Adresse  
+        Ihre Postleitzahl und Ort  
         """)
     
     elif page_type == "Datenschutz":
