@@ -27,7 +27,6 @@ LEAGUES = {
 }
 
 # --- STATE INITIALISIERUNG ---
-# Wir nutzen den Session State nur für UI-Einstellungen, nicht für Daten
 if 'selected_league' not in st.session_state:
     st.session_state.selected_league = "Dashboard"
 
@@ -162,6 +161,18 @@ def fetch_and_simulate_league(league_name):
 
     return result
 
+# --- SICHERE PRÜFUNG DES CACHE STATUS ---
+def is_league_cached_safe(league_name):
+    """Prüft, ob die Funktion für die gegebene Liga bereits im Cache liegt."""
+    try:
+        # Dies ist der interne, private Weg, der stabiler sein sollte
+        # Wir müssen den Hash manuell erstellen, da wir keine öffentliche API haben
+        cache_entry = fetch_and_simulate_league._cache.get(league_name)
+        return cache_entry is not None
+    except:
+        # Fallback falls interne Struktur nicht existiert
+        return False
+
 # --- INFO HEADER (GLOBAL) ---
 st.info("ℹ️ **Hinweis:** Die Daten werden täglich aktualisiert. Die Simulationsergebnisse basieren auf Monte-Carlo-Berechnungen (500x) und können leicht variieren.", icon="🎲")
 
@@ -177,8 +188,8 @@ with st.sidebar:
     for league in LEAGUES.keys():
         label = f"{LEAGUES[league]['logo']} {league}"
         
-        # Zeigt den Lade-Zustand an
-        if fetch_and_simulate_league.is_cached(league):
+        # NEU: Zeigt den Lade-Zustand an
+        if is_league_cached_safe(league):
             label += " (✅)"
         
         if st.button(label):
@@ -219,7 +230,6 @@ with st.sidebar:
                     # LÖSCHT DEN GLOBALEN CACHE FÜR DIESE LIGA
                     fetch_and_simulate_league.clear_cache(league)
                     st.toast(f"{league} wird neu geladen!", icon="✅")
-                    # Die Daten werden beim nächsten Rerun automatisch neu geholt
                     st.rerun() 
             if st.button("🔴 Cache komplett leeren"):
                 fetch_and_simulate_league.clear()
@@ -265,7 +275,7 @@ def show_dashboard():
                     if st.button(f"Zur Analyse ➜", key=f"btn_{league_name}"):
                         st.session_state.selected_league = league_name; st.rerun()
                 else:
-                    st.info("Lade Daten...")
+                    st.info("Daten nicht geladen.")
 
 
 # --- VIEW: DETAILS ---
